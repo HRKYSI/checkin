@@ -7,6 +7,7 @@
 <script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  [hidden] { display: none !important; }
   html, body { height: 100%; }
   body {
     font-family: "Helvetica Neue", Arial, "Hiragino Sans", sans-serif;
@@ -126,11 +127,19 @@ $('flip-btn').addEventListener('click', async () => {
 });
 
 async function startCamera() {
-  scanner = scanner || new Html5Qrcode('reader', { verbose: false });
+  scanner = scanner || new Html5Qrcode('reader', {
+    verbose: false,
+    formatsToSupport: [Html5QrcodeSupportedFormats.QR_CODE],
+    experimentalFeatures: { useBarCodeDetectorIfSupported: true }
+  });
   try {
     await scanner.start(
       { facingMode: facing },
-      { fps: 10, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.7); return { width: s, height: s }; } },
+      {
+        fps: 15,
+        // 枠で切り取らず画面全体を解析（小さいQRでも拾えるように）
+        videoConstraints: { facingMode: facing, width: { ideal: 1920 }, height: { ideal: 1080 } }
+      },
       onScan,
       () => {}
     );
