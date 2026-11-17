@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Check-in</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { height: 100%; }
+  body {
+    font-family: "Helvetica Neue", Arial, "Hiragino Sans", sans-serif;
+    background: #fff; color: #111;
+    display: flex; flex-direction: column; align-items: center;
+    -webkit-user-select: none; user-select: none;
+  }
+  header {
+    width: 100%; padding: 16px 24px; display: flex; justify-content: space-between; align-items: center;
+    border-bottom: 1px solid #e5e5e5; font-size: 13px; letter-spacing: .12em;
+  }
+  header .device { color: #888; }
+  main { flex: 1; width: 100%; max-width: 760px; padding: 24px; display: flex; flex-direction: column; align-items: center; gap: 24px; }
+  #reader { width: 100%; max-width: 420px; aspect-ratio: 1; background: #f3f3f3; overflow: hidden; }
+  #reader video { object-fit: cover; }
+  .hint { font-size: 15px; color: #666; letter-spacing: .06em; text-align: center; }
+
+  #card {
+    display: none; width: 100%; padding: 40px 32px; text-align: center;
+    border: 2px solid #111;
+  }
+  #card.show { display: block; }
+  #card .badge { display: inline-block; padding: 6px 14px; font-size: 13px; letter-spacing: .14em; margin-bottom: 20px; background: #111; color: #fff; }
+  #card.repeat { border-color: #b7791f; }
+  #card.repeat .badge { background: #b7791f; }
+  #card.unknown { border-color: #c53030; }
+  #card.unknown .badge { background: #c53030; }
+  #card .name { font-size: 44px; font-weight: 600; line-height: 1.25; word-break: break-word; }
+  #card .org { font-size: 24px; margin-top: 10px; }
+  #card .meta { font-size: 15px; color: #777; margin-top: 16px; }
+  #card .note { margin-top: 20px; padding-top: 16px; border-top: 1px solid #e5e5e5; font-size: 18px; text-align: left; white-space: pre-wrap; }
+  #card .note:empty { display: none; }
+
+  .controls { display: flex; gap: 12px; }
+  button {
+    font: inherit; font-size: 15px; letter-spacing: .08em; padding: 14px 28px;
+    border: 1px solid #111; background: #fff; color: #111; cursor: pointer;
+  }
+  button.primary { background: #111; color: #fff; }
+  #start-screen { display: flex; flex-direction: column; align-items: center; gap: 16px; margin-top: 15vh; }
+  #err { color: #c53030; font-size: 14px; text-align: center; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <span>CHECK-IN</span>
+  <span class="device" id="device-label"></span>
+</header>
+
+<main>
+  <div id="start-screen">
+    <p class="hint">受付を開始します</p>
+    <button class="primary" id="start-btn">START</button>
+    <p id="err"></p>
+  </div>
+
+  <div id="reader" hidden></div>
+  <p class="hint" id="scan-hint" hidden>QRコードをカメラにかざしてください</p>
+
+  <div id="card">
+    <div class="badge" id="c-badge"></div>
+    <div class="name" id="c-name"></div>
+    <div class="org" id="c-org"></div>
+    <div class="meta" id="c-meta"></div>
+    <div class="note" id="c-note"></div>
+  </div>
+
+  <div class="controls" id="controls" hidden>
+    <button id="flip-btn">カメラ切替</button>
+  </div>
+</main>
+
+<script>
+/* ---------- 設定 ---------- */
+const RESULT_MS = 5000;       // 結果表示の秒数
+const SAME_ID_COOLDOWN = 8000; // 同じQRを連続で読んだときの無視時間
+
+// GAS 上で開いた場合は google.script.run を使う
+const IN_GAS = typeof google !== 'undefined' && google.script && google.script.run;
+
+// 静的ホスティング版: ?api=<exec URL>&k=<token>&d=<端末名> を初回だけ付けて開く（localStorage に保存）
+const store = {
+  get(k) { try { return localStorage.getItem(k); } catch (e) { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch (e) {} }
+};
+const qs = new URLSearchParams(location.search);
+['api', 'k', 'd'].forEach(key => { if (qs.get(key)) store.set('ci_' + key, qs.get(key)); });
+if (!IN_GAS && qs.toString()) history.replaceState(null, '', location.pathname);
+
+const API = store.get('ci_api') || '';
+const TOKEN = IN_GAS ? '__TOKEN__' : (store.get('ci_k') || '');
+const DEVICE = store.get('ci_d') || 'iPad';
+document.getElementById('device-label').textContent = DEVICE;
+
+/* ---------- 要素 ---------- */
+const $ = id => document.getElementById(id);
+let scanner, facing = 'user', busy = false, lastId = '', lastAt = 0, resetTimer;
+
+/* ---------- 開始 ---------- */
+$('start-btn').addEventListener('click', async () => {
+  if (!IN_GAS && (!API || !TOKEN)) {
+    $('err').textContent = 'API の URL またはトークンが未設定です。\n?api=...&k=... を付けて開いてください。';
+    return;
+  }
+  initAudio();
+  $('start-screen').hidden = true;
+  $('reader').hidden = false;
+  $('scan-hint').hidden = false;
+  $('controls').hidden = false;
+  await startCamera();
+});
+
+$('flip-btn').addEventListener('click', async () => {
+  facing = facing === 'user' ? 'environment' : 'user';
+  await scanner.stop();
+  await startCamera();
+});
+
+async function startCamera() {
+  scanner = scanner || new Html5Qrcode('reader', { verbose: false });
+  try {
+    await scanner.start(
+      { facingMode: facing },
+      { fps: 10, qrbox: (w, h) => { const s = Math.floor(Math.min(w, h) * 0.7); return { width: s, height: s }; } },
+      onScan,
+      () => {}
+    );
+  } catch (e) {
+    $('start-screen').hidden = false;
+    $('reader').hidden = true;
+    $('scan-hint').hidden = true;
+    $('controls').hidden = true;
+    $('err').textContent = 'カメラを起動できませんでした。\n' + e;
+  }
+}
+
+/* ---------- 読み取り ---------- */
+function onScan(text) {
+  const id = String(text).trim();
+  const now = Date.now();
+  if (busy) return;
+  if (id === lastId && now - lastAt < SAME_ID_COOLDOWN) return;
+  busy = true; lastId = id; lastAt = now;
+  beep(880);
+  showCard({ status: 'LOADING' });
+
+  if (IN_GAS) {
+    google.script.run
+      .withSuccessHandler(render)
+      .withFailureHandler(err => render({ ok: false, error: String(err) }))
+      .checkinFromPage(id, TOKEN, DEVICE);
+  } else {
+    const url = API + '?action=checkin&id=' + encodeURIComponent(id) +
+      '&k=' + encodeURIComponent(TOKEN) + '&d=' + encodeURIComponent(DEVICE);
+    fetch(url).then(r => r.json()).then(render)
+      .catch(err => render({ ok: false, error: String(err) }));
+  }
+}
+
+/* ---------- 表示 ---------- */
+function render(res) {
+  if (!res.ok) {
+    showCard({ status: 'ERROR', name: '通信エラー', org: res.error || '' });
+    beep(220);
+  } else {
+    showCard(res);
+    if (res.status === 'UNKNOWN') beep(220);
+  }
+  clearTimeout(resetTimer);
+  resetTimer = setTimeout(() => {
+    $('card').className = '';
+    busy = false;
+  }, RESULT_MS);
+}
+
+function showCard(r) {
+  const card = $('card');
+  const labels = {
+    LOADING: '照合中…',
+    OK: 'WELCOME',
+    REPEAT: '再来場（' + (r.count || '') + '回目）',
+    UNKNOWN: '未登録のQRコード',
+    ERROR: 'ERROR'
+  };
+  card.className = 'show' +
+    (r.status === 'REPEAT' ? ' repeat' : '') +
+    (r.status === 'UNKNOWN' || r.status === 'ERROR' ? ' unknown' : '');
+  $('c-badge').textContent = labels[r.status] || '';
+  $('c-name').textContent = r.status === 'UNKNOWN' ? (r.id || '') : (r.name || '');
+  $('c-org').textContent = r.org || '';
+  $('c-meta').textContent = r.time ? [r.country, r.time + ' 受付'].filter(Boolean).join('　/　') : '';
+  $('c-note').textContent = r.note || '';
+}
+
+/* ---------- 音 ---------- */
+let ctx;
+function initAudio() {
+  try { ctx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {}
+}
+function beep(freq) {
+  if (!ctx) return;
+  const o = ctx.createOscillator(), g = ctx.createGain();
+  o.frequency.value = freq; o.connect(g); g.connect(ctx.destination);
+  g.gain.setValueAtTime(0.15, ctx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.18);
+  o.start(); o.stop(ctx.currentTime + 0.2);
+}
+</script>
+</body>
+</html>
